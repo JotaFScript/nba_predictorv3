@@ -1,0 +1,16 @@
+# Blueprint de Render: sube el proyecto a GitHub y crea un "Blueprint" desde este archivo.
+services:
+  - type: web
+    name: nba-predictor
+    runtime: python
+    plan: free
+    buildCommand: echo "Sin dependencias que instalar"
+    startCommand: python app.py
+    healthCheckPath: /salud
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: NBA_NUBE
+        value: "1"
+      - key: NBA_REFRESCO_HORAS
+        value: "6"
