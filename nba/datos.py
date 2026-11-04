@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from . import config
@@ -35,6 +35,11 @@ HEADERS_STATS = {
     "Origin": "https://www.nba.com",
 }
 HEADERS_CDN = {"User-Agent": HEADERS_STATS["User-Agent"], "Accept-Encoding": "gzip"}
+HEADERS_ESPN = {"User-Agent": HEADERS_STATS["User-Agent"], "Accept": "application/json",
+                "Accept-Encoding": "gzip"}
+URL_ESPN = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+# ESPN usa abreviaturas distintas de la NBA en algunos equipos.
+ESPN_ABREV = {"GS": "GSW", "NY": "NYK", "NO": "NOP", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS"}
 
 URL_GAMELOG = "https://stats.nba.com/stats/leaguegamelog"
 URL_SCOREBOARD = "https://stats.nba.com/stats/scoreboardv3"
@@ -73,7 +78,8 @@ def descargar_temporada(anio: int) -> list[dict]:
         "Season": config.etiqueta_temporada(anio),
         "SeasonType": "Regular Season", "Sorter": "DATE",
     }
-    datos = _get_json(URL_GAMELOG + "?" + urllib.parse.urlencode(params), HEADERS_STATS)
+    datos = _get_json(URL_GAMELOG + "?" + urllib.parse.urlencode(params), HEADERS_STATS,
+                      intentos=2, timeout=30)
     conjuntos = datos.get("resultSets") or [datos.get("resultSet")]
     rs = conjuntos[0]
     cab = rs["headers"]
@@ -148,8 +154,52 @@ def cargar_registros() -> list[dict]:
     return filas
 
 
+def _fecha_fila(r: dict) -> date:
+    return datetime.strptime(str(r["GAME_DATE"])[:10], "%Y-%m-%d").date()
+
+
+def completar_con_espn(por_temp: dict, hoy: date, progreso=print, max_dias: int = 150, pausa: float = 0.3) -> int:
+    """Añade partidos terminados desde ESPN (solo marcador: sin FGA/FTA/etc.). Devuelve cuántos añadió."""
+    filas = [r for lista in por_temp.values() for r in lista]
+    if not filas:
+        return 0
+    ultima = max(_fecha_fila(r) for r in filas)
+    desde = max(ultima - timedelta(days=1), hoy - timedelta(days=max_dias))
+    ids_equipo = {r["TEAM_ABBREVIATION"]: r.get("TEAM_ID") for r in filas if r.get("TEAM_ID")}
+    existentes = {(str(r["GAME_DATE"])[:10], r["TEAM_ABBREVIATION"], str(r["MATCHUP"]).split()[-1])
+                  for r in filas if "vs." in str(r["MATCHUP"])}
+    nuevos, dia = 0, desde
+    while dia <= hoy:
+        progreso(f"Buscando partidos en ESPN: {dia.isoformat()}...")
+        for ev in _espn_eventos(_get_json(_url_espn(dia), HEADERS_ESPN, intentos=2, timeout=20)):
+            if not ev["final"] or ev["tipo_temporada"] not in (None, 2):
+                continue
+            if (dia.isoformat(), ev["local"], ev["visitante"]) in existentes:
+                continue
+            anio = config.anio_temporada(dia)
+            for eq, riv, pts, opp, casa, nombre in (
+                (ev["local"], ev["visitante"], ev["pts_local"], ev["pts_visitante"], True, ev["nombre_local"]),
+                (ev["visitante"], ev["local"], ev["pts_visitante"], ev["pts_local"], False, ev["nombre_visitante"]),
+            ):
+                por_temp[anio].append({
+                    "SEASON_ID": f"2{anio}", "TEAM_ID": ids_equipo.get(eq, ""), "TEAM_ABBREVIATION": eq,
+                    "TEAM_NAME": nombre or eq, "GAME_ID": f"ESPN{ev['id']}", "GAME_DATE": dia.isoformat(),
+                    "MATCHUP": f"{eq} vs. {riv}" if casa else f"{eq} @ {riv}",
+                    "WL": "W" if pts > opp else "L", "MIN": 240.0, "PTS": float(pts),
+                    "PLUS_MINUS": pts - opp, "FUENTE": "espn"})
+            nuevos += 1
+        dia += timedelta(days=1)
+        if dia <= hoy:
+            time.sleep(pausa)
+    return nuevos
+
+
 def actualizar_datos(progreso=print, hoy: date | None = None, pausa: float = 1.5) -> dict:
-    """Descarga lo que falta (y siempre la temporada en curso). Devuelve un resumen."""
+    """Descarga lo que falta (y siempre la temporada en curso). Devuelve un resumen.
+
+    Fuente principal: stats.nba.com (datos completos). Si no responde (típico en servidores en la
+    nube), la temporada en curso se completa con los marcadores de ESPN.
+    """
     hoy = hoy or date.today()
     existentes = cargar_registros()
     por_temp: dict[int, list[dict]] = defaultdict(list)
@@ -167,21 +217,35 @@ def actualizar_datos(progreso=print, hoy: date | None = None, pausa: float = 1.5
         if ultima < f"{anio + 1}-04-05":      # temporada cacheada incompleta
             pendientes.append(anio)
 
-    descargadas, errores = [], []
+    descargadas, errores, fallos_seguidos = [], [], 0
     for i, anio in enumerate(pendientes):
         etq = config.etiqueta_temporada(anio)
+        if fallos_seguidos >= 2:              # stats.nba.com no responde: no esperar por cada temporada
+            errores.append(f"{etq}: omitida (stats.nba.com no responde)")
+            continue
         progreso(f"Descargando temporada {etq} ({i + 1}/{len(pendientes)})...")
         try:
             nuevas = descargar_temporada(anio)
+            fallos_seguidos = 0
             if nuevas:
                 por_temp[anio] = nuevas
                 descargadas.append(etq)
             elif anio != actual:
                 errores.append(f"{etq}: sin datos")
         except Exception as e:  # noqa: BLE001 - se informa y se continúa
+            fallos_seguidos += 1
             errores.append(f"{etq}: {e}")
-        if i < len(pendientes) - 1:
+        if i < len(pendientes) - 1 and fallos_seguidos == 0:
             time.sleep(pausa)
+
+    etq_actual = config.etiqueta_temporada(actual)
+    if actual in pendientes and etq_actual not in descargadas and por_temp:
+        try:
+            n = completar_con_espn(por_temp, hoy, progreso, pausa=min(pausa, 0.3))
+            if n:
+                descargadas.append(f"{etq_actual} (+{n} partidos vía ESPN)")
+        except Exception as e:  # noqa: BLE001
+            errores.append(f"ESPN: {e}")
 
     todo = [r for anio in sorted(por_temp) for r in por_temp[anio]]
     vistos, unicos = set(), []
@@ -230,7 +294,7 @@ def _cargar_calendario() -> dict:
             return json.loads(ruta.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
-    datos = _get_json(URL_CALENDARIO, HEADERS_CDN)
+    datos = _get_json(URL_CALENDARIO, HEADERS_CDN, intentos=1, timeout=15)
     try:
         ruta.parent.mkdir(parents=True, exist_ok=True)
         ruta.write_text(json.dumps(datos), encoding="utf-8")
@@ -239,30 +303,95 @@ def _cargar_calendario() -> dict:
     return datos
 
 
-def partidos_del_dia(fecha: date) -> list[dict]:
-    """Partidos programados para `fecha` (calendario oficial; respaldo: scoreboard)."""
-    try:
-        cal = _cargar_calendario()
-        out = []
-        for gd in cal["leagueSchedule"]["gameDates"]:
-            for g in gd.get("games", []):
-                d = _juego_a_dict(g)
-                if d and d["_fecha"] == fecha:
-                    out.append(d)
-        if out:
-            return out
-        # Sin coincidencias: puede ser un día sin juegos o un calendario viejo.
-        if _calendario_cubre(cal, fecha):
-            return []
-    except (ErrorDatos, KeyError, TypeError, ValueError):
-        pass
-    url = URL_SCOREBOARD + "?" + urllib.parse.urlencode({"GameDate": fecha.isoformat(), "LeagueID": "00"})
-    datos = _get_json(url, HEADERS_STATS)
-    juegos = (datos.get("scoreboard") or {}).get("games", [])
-    out = [d for d in (_juego_a_dict(g) for g in juegos) if d]
-    return out
-
-
 def _calendario_cubre(cal: dict, fecha: date) -> bool:
     anio = config.anio_temporada(fecha)
     return str(cal.get("leagueSchedule", {}).get("seasonYear", ""))[:4] == str(anio)
+
+
+def _desde_calendario_nba(fecha: date):
+    cal = _cargar_calendario()
+    out = []
+    for gd in cal["leagueSchedule"]["gameDates"]:
+        for g in gd.get("games", []):
+            d = _juego_a_dict(g)
+            if d and d["_fecha"] == fecha:
+                out.append(d)
+    if out or _calendario_cubre(cal, fecha):
+        return out
+    return None                      # el calendario no cubre esa fecha: probar otra fuente
+
+
+def _url_espn(fecha: date) -> str:
+    return URL_ESPN + "?" + urllib.parse.urlencode({"dates": fecha.strftime("%Y%m%d"), "limit": 100})
+
+
+def _espn_eventos(js: dict) -> list[dict]:
+    out = []
+    for ev in js.get("events", []):
+        try:
+            comp = ev["competitions"][0]
+            lados = {c["homeAway"]: c for c in comp["competitors"]}
+            tipo = ev["status"]["type"]
+            final = tipo.get("completed") is True or tipo.get("name") == "STATUS_FINAL"
+            temporada = (ev.get("season") or {}).get("type")
+            ab = lambda c: ESPN_ABREV.get(c["team"]["abbreviation"], c["team"]["abbreviation"])
+            pts = lambda c: int(float(c.get("score") or 0))
+            out.append({
+                "id": ev["id"], "final": final, "tipo_temporada": temporada,
+                "estado": "Final" if final else (tipo.get("shortDetail") or tipo.get("detail") or "").strip(),
+                "local": ab(lados["home"]), "visitante": ab(lados["away"]),
+                "nombre_local": lados["home"]["team"].get("displayName"),
+                "nombre_visitante": lados["away"]["team"].get("displayName"),
+                "pts_local": pts(lados["home"]), "pts_visitante": pts(lados["away"]),
+            })
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _desde_espn(fecha: date):
+    juegos = []
+    for ev in _espn_eventos(_get_json(_url_espn(fecha), HEADERS_ESPN, intentos=2, timeout=20)):
+        juegos.append({"id": ev["id"], "local": ev["local"], "visitante": ev["visitante"],
+                       "estado": ev["estado"],
+                       "pts_local": ev["pts_local"] if ev["final"] else None,
+                       "pts_visitante": ev["pts_visitante"] if ev["final"] else None,
+                       "_fecha": fecha})
+    return juegos
+
+
+def _desde_stats_nba(fecha: date):
+    url = URL_SCOREBOARD + "?" + urllib.parse.urlencode({"GameDate": fecha.isoformat(), "LeagueID": "00"})
+    datos = _get_json(url, HEADERS_STATS, intentos=1, timeout=20)
+    juegos = (datos.get("scoreboard") or {}).get("games", [])
+    return [d for d in (_juego_a_dict(g) for g in juegos) if d]
+
+
+_FUENTES = (("calendario NBA", _desde_calendario_nba), ("ESPN", _desde_espn), ("stats.nba.com", _desde_stats_nba))
+_FALLOS: dict[str, float] = {}          # fuente -> momento del último fallo (no reintentar durante 10 min)
+_CACHE_DIA: dict[date, tuple] = {}
+
+
+def partidos_del_dia(fecha: date) -> list[dict]:
+    """Partidos de `fecha`. Prueba calendario NBA, luego ESPN, luego stats.nba.com."""
+    hit = _CACHE_DIA.get(fecha)
+    ttl = 3600 if fecha < date.today() else 90
+    if hit and time.time() - hit[0] < ttl:
+        return [dict(g) for g in hit[1]]
+    errores = []
+    for respetar_memoria in (True, False):
+        for nombre, fuente in _FUENTES:
+            if respetar_memoria and time.time() - _FALLOS.get(nombre, 0) < 600:
+                continue
+            try:
+                res = fuente(fecha)
+            except Exception as e:  # noqa: BLE001
+                _FALLOS[nombre] = time.time()
+                errores.append(f"{nombre}: {e}")
+                continue
+            if res is not None:
+                _CACHE_DIA[fecha] = (time.time(), res)
+                return [dict(g) for g in res]
+        if errores:
+            break
+    raise ErrorDatos("No se pudo obtener la cartelera. " + " | ".join(errores))

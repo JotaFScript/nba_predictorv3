@@ -25,6 +25,7 @@ class App:
         self.informe: dict | None = None
         self.sin_datos = False
         self.n_registros = 0
+        self.actualizacion = {"cuando": None, "mensaje": "Aún no se ha intentado actualizar."}
         self.trabajo = {"activo": False, "nombre": "", "mensaje": "", "error": None}
         self.lock = threading.Lock()
         self.ultimo_acceso = time.time()
@@ -47,11 +48,16 @@ class App:
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
                 self.trabajo["error"] = str(e) or e.__class__.__name__
+                if nombre == "Actualizando datos":
+                    self._anotar(f"Error: {self.trabajo['error']}")
             finally:
                 self.trabajo["activo"] = False
 
         threading.Thread(target=correr, daemon=True).start()
         return True
+
+    def _anotar(self, mensaje: str):
+        self.actualizacion = {"cuando": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), "mensaje": mensaje}
 
     def _reconstruir(self, progreso):
         progreso("Leyendo historial...")
@@ -77,8 +83,11 @@ class App:
     def tarea_actualizar(self, progreso):
         resumen = datos.actualizar_datos(progreso)
         self._reconstruir(progreso)
+        nuevas = ", ".join(resumen["descargadas"]) or "sin cambios"
         extra = f" Avisos: {'; '.join(resumen['errores'])}" if resumen["errores"] else ""
-        progreso(f"Datos actualizados ({resumen['registros']} registros).{extra}")
+        mensaje = f"{resumen['registros']} registros ({nuevas}).{extra}"
+        self._anotar(mensaje)
+        progreso("Datos actualizados. " + mensaje)
 
     def tarea_evaluar(self, progreso):
         if not self.predictor:
@@ -203,7 +212,7 @@ class Manejador(BaseHTTPRequestHandler):
         return {
             "version": __version__, "hoy": date.today().isoformat(), "nube": config.NUBE,
             "listo": p is not None, "sin_datos": APP.sin_datos,
-            "trabajo": APP.trabajo, "informe_listo": APP.informe is not None,
+            "trabajo": APP.trabajo, "actualizacion": APP.actualizacion, "informe_listo": APP.informe is not None,
             "partidos": p.n_partidos if p else 0,
             "ultima_fecha": p.motor.ultima_fecha.isoformat() if p else None,
             "equipos": p.equipos_activos() if p else [],
@@ -260,7 +269,7 @@ def crear_servidor(puerto: int = 8765, host: str = "127.0.0.1") -> ThreadingHTTP
 
 def _planificador():
     """Nube: refresca los datos periódicamente (si la NBA bloquea la descarga, se conserva el modelo actual)."""
-    time.sleep(45)
+    time.sleep(5)
     while True:
         while APP.trabajo["activo"]:
             time.sleep(5)

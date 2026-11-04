@@ -71,7 +71,7 @@ class EstadoEquipo:
 def _poseciones(r: dict) -> float | None:
     try:
         return r["FGA"] + 0.44 * r["FTA"] - r["OREB"] + r["TOV"]
-    except TypeError:
+    except (TypeError, KeyError):
         return None
 
 

@@ -54,6 +54,8 @@ def test_actualizar_incremental():
 def test_error_parcial():
     config.CSV_HISTORICO.unlink()
     def falso(url, headers, **k):
+        if "stats.nba.com" not in url:
+            raise datos.ErrorDatos("sin ESPN en esta prueba")
         anio = int(url.split("Season=")[1][:4])
         if anio == 2020:
             raise datos.ErrorDatos("sin red")
@@ -91,3 +93,77 @@ def test_csv_legado():
 if __name__ == "__main__":
     test_actualizar_incremental(); test_error_parcial(); test_calendario(); test_csv_legado()
     print("\nTODO OK")
+
+
+# ---------------------------------------------------------------- ESPN --
+def _espn_json(partidos, tipo=2):
+    ev = []
+    for i, (loc, vis, pl, pv, final) in enumerate(partidos):
+        ev.append({"id": f"4{i:05d}", "season": {"type": tipo},
+                   "status": {"type": {"name": "STATUS_FINAL" if final else "STATUS_SCHEDULED", "completed": final,
+                                       "shortDetail": "Final" if final else "11/4 - 7:30 PM EST"}},
+                   "competitions": [{"competitors": [
+                       {"homeAway": "home", "score": str(pl), "team": {"abbreviation": loc, "displayName": loc + " X"}},
+                       {"homeAway": "away", "score": str(pv), "team": {"abbreviation": vis, "displayName": vis + " X"}}]}]})
+    return {"events": ev}
+
+
+def test_respaldo_espn_actualiza_datos():
+    """stats.nba.com bloqueado (como en Render): la temporada en curso se completa con ESPN."""
+    from datetime import timedelta
+    config.CSV_HISTORICO.unlink(missing_ok=True)
+    base = generar(primera=2019, temporadas=8)
+    datos.escribir_csv(config.CSV_HISTORICO, [r for r in base if r["SEASON_ID"] != "22026"])  # semilla sin la actual
+    hoy = date(2026, 11, 4)
+
+    def falso(url, headers, **k):
+        if "stats.nba.com" in url:
+            raise datos.ErrorDatos("bloqueado")
+        dia = url.split("dates=")[1][:8]
+        if dia == "20261103":
+            return _espn_json([("BOS", "LAL", 110, 101, True), ("GS", "NY", 99, 104, True), ("DEN", "MIA", 0, 0, False)])
+        return _espn_json([])
+    datos._get_json = falso
+    antes = len(datos.cargar_registros())
+    r = datos.actualizar_datos(progreso=lambda m: None, hoy=hoy, pausa=0)
+    assert any("ESPN" in d and "+2" in d for d in r["descargadas"]), r
+    filas = datos.cargar_registros()
+    assert len(filas) == antes + 4
+    nuevas = [f for f in filas if f["GAME_ID"].startswith("ESPN")]
+    assert {f["TEAM_ABBREVIATION"] for f in nuevas} == {"BOS", "LAL", "GSW", "NYK"}   # GS->GSW, NY->NYK
+    assert all(f["SEASON_ID"] == "22026" and f["GAME_DATE"] == "2026-11-03" for f in nuevas)
+    # segunda ejecución: no duplica los mismos partidos
+    r2 = datos.actualizar_datos(progreso=lambda m: None, hoy=hoy, pausa=0)
+    assert len(datos.cargar_registros()) == antes + 4, "duplicó partidos de ESPN"
+    # el modelo debe poder usar filas sin FGA/FTA (solo marcador)
+    from nba.features import construir_partidos
+    assert len(construir_partidos(datos.cargar_registros())) > 0
+    print("OK respaldo ESPN (sin duplicar, abreviaturas corregidas):", r["descargadas"])
+
+
+def test_cartelera_con_respaldo():
+    datos._CACHE_DIA.clear(); datos._FALLOS.clear()
+    config.CACHE_CALENDARIO.unlink(missing_ok=True)
+
+    def falso(url, headers, **k):
+        if "espn.com" in url:
+            return _espn_json([("BOS", "LAL", 0, 0, False), ("GS", "NY", 0, 0, False)])
+        raise datos.ErrorDatos("bloqueado")
+    datos._get_json = falso
+    js = datos.partidos_del_dia(date(2026, 11, 5))
+    assert [(j["visitante"], j["local"]) for j in js] == [("LAL", "BOS"), ("NYK", "GSW")]
+    assert js[0]["estado"] == "11/4 - 7:30 PM EST" and js[0]["pts_local"] is None
+    # si todas las fuentes fallan, el error dice cuáles
+    datos._CACHE_DIA.clear(); datos._FALLOS.clear(); config.CACHE_CALENDARIO.unlink(missing_ok=True)
+    datos._get_json = lambda *a, **k: (_ for _ in ()).throw(datos.ErrorDatos("sin red"))
+    try:
+        datos.partidos_del_dia(date(2026, 11, 6))
+        raise AssertionError("debía fallar")
+    except datos.ErrorDatos as e:
+        assert "ESPN" in str(e) and "calendario NBA" in str(e)
+    print("OK cartelera con respaldo ESPN y errores descriptivos")
+
+
+if __name__ == "__main__":
+    test_respaldo_espn_actualiza_datos(); test_cartelera_con_respaldo()
+    print("TODO OK (ESPN)")

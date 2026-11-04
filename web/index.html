@@ -238,6 +238,7 @@ async function sondear() {
   let intervalo = 15000;
   try {
     estado = await api("/api/estado");
+    $(".estado").title = estado.actualizacion ? `Última actualización de datos (${estado.actualizacion.cuando || "pendiente"}): ${estado.actualizacion.mensaje}` : "";
     if (estado.nube) { $("#btnAct").style.display = "none"; $("#btnSalir").style.display = "none"; $("#btnEval").style.display = "none"; }
     pintarEstado();
     if (estado.trabajo.activo || !estado.listo && !estado.sin_datos) intervalo = 900;

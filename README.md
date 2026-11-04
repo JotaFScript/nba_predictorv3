@@ -19,15 +19,21 @@ Solo usa la biblioteca estándar de Python: **no hay que instalar nada** (ni pan
 **Cómo se comporta en la nube**
 - Escucha en `0.0.0.0:$PORT` (Render define `PORT`); `/salud` responde de inmediato mientras el modelo carga.
 - Se entrena al arrancar con el CSV del repositorio y calcula la evaluación sola.
-- Cada `NBA_REFRESCO_HORAS` horas (por defecto 6) intenta descargar datos nuevos y reentrena si hay cambios.
+- Cada `NBA_REFRESCO_HORAS` horas (por defecto 6) actualiza los datos y reentrena si hay cambios. Fuentes, en orden:
+  `stats.nba.com` (datos completos) y, si bloquea al servidor, **ESPN** (marcadores de los partidos nuevos).
+- La cartelera usa, en orden: calendario oficial de la NBA, ESPN y `stats.nba.com`. Si todas fallan, la pantalla
+  muestra el error de cada una.
+- Para saber qué pasó con la última actualización abre `https://TU-APP.onrender.com/api/estado` (campo `actualizacion`)
+  o pasa el cursor sobre el indicador de estado de la cabecera.
 - Las rutas administrativas (`/api/actualizar`, `/api/evaluar`, `/api/salir`) están bloqueadas para el público.
 
 **Cosas a tener en cuenta**
 - El disco del plan gratuito es efímero: lo descargado se pierde al reiniciar; por eso el CSV debe estar en el repositorio.
   Para actualizarlo de forma permanente, repite el paso 1 y haz `git push`.
 - El plan gratuito se duerme tras ~15 min sin visitas; el primer acceso tarda mientras entrena.
-- `stats.nba.com` suele bloquear IPs de servidores en la nube. Si la actualización automática falla, la app sigue
-  funcionando con el CSV del repositorio (la cartelera usa `cdn.nba.com`, que normalmente sí responde).
+- `stats.nba.com` suele bloquear IPs de servidores en la nube. Los partidos añadidos por ESPN traen solo el marcador
+  (sin tiros ni rebotes), así que su rating ofensivo/defensivo es una aproximación; al volver a descargar la temporada
+  completa desde la NBA (por ejemplo, desde tu PC) se reemplazan por los datos completos.
 
 ## Pestañas
 Cartelera (cualquier fecha) · Partido manual (con ajuste por bajas y línea) · Rendimiento (backtest frente a
